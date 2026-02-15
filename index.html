@@ -109,6 +109,7 @@
 
     const world = {
       bodies: [],
+      compounds: [],
       dt: 1 / 60,
       width: 0,
       height: 0,
@@ -159,6 +160,12 @@
 
     function clamp(v, lo, hi) {
       return Math.max(lo, Math.min(hi, v));
+    }
+
+    function rotate(v, angle) {
+      const c = Math.cos(angle);
+      const s = Math.sin(angle);
+      return vec(v.x * c - v.y * s, v.x * s + v.y * c);
     }
 
     function rand(min, max) {
@@ -368,7 +375,46 @@
     function resolveCollisions() {
       for (let i = 0; i < world.bodies.length; i += 1) {
         for (let j = i + 1; j < world.bodies.length; j += 1) {
+          if (world.bodies[i].compoundId && world.bodies[i].compoundId === world.bodies[j].compoundId) continue;
           resolveCollision(world.bodies[i], world.bodies[j], world.dt);
+        }
+      }
+    }
+
+    function enforceCompoundConstraints() {
+      for (const compound of world.compounds) {
+        let totalMass = 0;
+        let center = vec(0, 0);
+        let avgVel = vec(0, 0);
+        let avgAcc = vec(0, 0);
+        let avgAngularVelocity = 0;
+
+        for (const part of compound.parts) {
+          totalMass += part.mass;
+          center = add(center, mul(part.pos, part.mass));
+          avgVel = add(avgVel, mul(part.vel, part.mass));
+          avgAcc = add(avgAcc, mul(part.acc, part.mass));
+          avgAngularVelocity += part.angularVelocity;
+        }
+
+        if (totalMass <= Number.EPSILON) continue;
+
+        center = mul(center, 1 / totalMass);
+        avgVel = mul(avgVel, 1 / totalMass);
+        avgAcc = mul(avgAcc, 1 / totalMass);
+        avgAngularVelocity /= compound.parts.length;
+
+        const orientation = compound.rotateWithHeading ? compound.headingSource.heading : 0;
+
+        for (const part of compound.parts) {
+          const targetOffset = compound.rotateWithHeading ? rotate(part.compoundOffset, orientation) : part.compoundOffset;
+          part.pos = add(center, targetOffset);
+          part.vel = vec(avgVel.x, avgVel.y);
+          part.acc = vec(avgAcc.x, avgAcc.y);
+          part.angularVelocity = avgAngularVelocity;
+          if (compound.rotateWithHeading) {
+            part.heading = compound.headingSource.heading;
+          }
         }
       }
     }
@@ -394,9 +440,11 @@
     }
 
     function updatePlayer(body) {
-      // FIX: Increased thrust from 500 to 400,000 to match mass scale (2400)
-      const thrust = 400000; 
-      body.acc = mul(input.value, thrust / Math.max(1, body.mass));
+      const thrust = 400000;
+      const playerParts = world.playerParts || [body];
+      for (const part of playerParts) {
+        part.acc = mul(input.value, thrust / Math.max(1, part.mass));
+      }
       if (lengthSquared(input.value) > 0.0001) {
         body.heading = Math.atan2(input.value.y, input.value.x);
       }
@@ -436,6 +484,7 @@
 
       for (const body of world.bodies) integrate(body);
       resolveCollisions();
+      enforceCompoundConstraints();
 
       ctx.clearRect(0, 0, world.width, world.height);
       for (const body of world.bodies) drawBody(body);
@@ -514,25 +563,74 @@
     }
 
     function seedWorld() {
-      const player = createBody({
+      world.compounds = [];
+      let compoundSeed = 0;
+      const createCompound = ({ center, velocity, color, type = "asteroid", rotateWithHeading = false, parts }) => {
+        const compoundId = `compound-${compoundSeed}`;
+        compoundSeed += 1;
+
+        const bodies = parts.map((part, index) => {
+          const offset = vec(part.offset.x, part.offset.y);
+          return createBody({
+            type,
+            pos: add(center, offset),
+            vel: vec(velocity.x, velocity.y),
+            mass: part.radius * part.radius * 25,
+            radius: part.radius,
+            color,
+            angularVelocity: rand(-0.2, 0.2),
+            compoundId,
+            compoundOffset: offset,
+            heading: 0,
+            isCompoundCore: index === 0,
+          });
+        });
+
+        world.compounds.push({
+          id: compoundId,
+          parts: bodies,
+          rotateWithHeading,
+          headingSource: bodies[0],
+        });
+
+        return bodies;
+      };
+
+      const playerParts = createCompound({
         type: "ship",
-        pos: vec(world.width * 0.35, world.height * 0.5),
-        mass: 2400,
-        radius: 16,
+        center: vec(world.width * 0.35, world.height * 0.5),
+        velocity: vec(),
         color: "#6aa4ff",
+        rotateWithHeading: true,
+        parts: [
+          { offset: vec(10, 0), radius: 11 },
+          { offset: vec(-8, 11), radius: 10 },
+          { offset: vec(-8, -11), radius: 10 },
+        ],
       });
 
       const colliders = [];
-      for (let i = 0; i < 22; i += 1) {
-        const radius = rand(12, 28);
-        colliders.push(createBody({
-          pos: vec(rand(radius, world.width - radius), rand(radius, world.height - radius)),
-          vel: vec(rand(-40, 40), rand(-40, 40)),
-          mass: radius * radius * 25,
-          radius,
-          color: `hsl(${rand(20, 50)} 28% ${rand(35, 55)}%)`,
-          angularVelocity: rand(-0.2, 0.2),
-        }));
+      for (let i = 0; i < 10; i += 1) {
+        const partCount = Math.floor(rand(2, 6));
+        const parts = [{ offset: vec(0, 0), radius: rand(10, 18) }];
+        for (let p = 1; p < partCount; p += 1) {
+          const angle = rand(0, Math.PI * 2);
+          const distance = rand(12, 30);
+          parts.push({
+            offset: vec(Math.cos(angle) * distance, Math.sin(angle) * distance),
+            radius: rand(8, 16),
+          });
+        }
+
+        const asteroidColor = `hsl(${rand(20, 50)} 28% ${rand(35, 55)}%)`;
+        const center = vec(rand(60, world.width - 60), rand(60, world.height - 60));
+        const asteroidParts = createCompound({
+          center,
+          velocity: vec(rand(-40, 40), rand(-40, 40)),
+          color: asteroidColor,
+          parts,
+        });
+        colliders.push(...asteroidParts);
       }
 
       const anchor = createBody({
@@ -544,8 +642,9 @@
         color: "#5f6778",
       });
 
-      world.player = player;
-      world.bodies = [player, anchor, ...colliders];
+      world.player = playerParts[0];
+      world.playerParts = playerParts;
+      world.bodies = [...playerParts, anchor, ...colliders];
     }
 
     resize();
