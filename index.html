@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+  <title> Collision Prototype (Mobile)</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+      touch-action: none;
+    }
+
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #04070d;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+
+    .app {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    #world {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .hud {
+      position: absolute;
+      top: env(safe-area-inset-top, 0.5rem);
+      left: 0.75rem;
+      right: 0.75rem;
+      display: flex;
+      justify-content: space-between;
+      gap: 0.75rem;
+      color: #d8def5;
+      font-size: 0.8rem;
+      opacity: 0.9;
+      pointer-events: none;
+    }
+
+    .joystick {
+      position: absolute;
+      width: 9rem;
+      height: 9rem;
+      margin-left: -4.5rem;
+      margin-top: -4.5rem;
+      border-radius: 999px;
+      border: 2px solid rgba(160, 180, 255, 0.45);
+      background: rgba(80, 100, 180, 0.16);
+    }
+
+    .joystick.hidden {
+      opacity: 0;
+    }
+
+    .joystick-stick {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 3.25rem;
+      height: 3.25rem;
+      margin-left: -1.625rem;
+      margin-top: -1.625rem;
+      border-radius: 999px;
+      background: rgba(200, 220, 255, 0.7);
+      border: 1px solid rgba(220, 232, 255, 0.9);
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <canvas id="world" aria-label="Collision prototype world"></canvas>
+    <section class="hud">
+      <div>Supermass mobile collision prototype</div>
+      <div id="debug">ready</div>
+    </section>
+    <div id="joystick" class="joystick hidden" aria-hidden="true">
+      <div id="stick" class="joystick-stick"></div>
+    </div>
+  </main>
+  <script>
+    const canvas = document.getElementById("world");
+    const ctx = canvas.getContext("2d");
+    const joystickEl = document.getElementById("joystick");
+    const stickEl = document.getElementById("stick");
+    const debugEl = document.getElementById("debug");
+
+    const SPECULATIVE_CONTACT_THRESHOLD = 0.15;
+    const MAX_CORRECTION_FRACTION = 0.2;
+    const PENETRATION_SLOP = 1e-3;
+    const BAUMGARTE_BIAS = 0.25;
+
+    const CelestialBodyType = {
+      ASTEROID_MAX: 5e4,
+      MOON_MAX: 2e6,
+    };
+
+    const world = {
+      bodies: [],
+      dt: 1 / 60,
+      width: 0,
+      height: 0,
+    };
+
+    const input = {
+      pointerId: null,
+      center: { x: 0, y: 0 },
+      value: { x: 0, y: 0 },
+      maxRadius: 58,
+    };
+
+    function vec(x = 0, y = 0) {
+      return { x, y };
+    }
+
+    function add(a, b) {
+      return vec(a.x + b.x, a.y + b.y);
+    }
+
+    function sub(a, b) {
+      return vec(a.x - b.x, a.y - b.y);
+    }
+
+    function mul(a, s) {
+      return vec(a.x * s, a.y * s);
+    }
+
+    function dot(a, b) {
+      return a.x * b.x + a.y * b.y;
+    }
+
+    function length(v) {
+      return Math.hypot(v.x, v.y);
+    }
+
+    function lengthSquared(v) {
+      return v.x * v.x + v.y * v.y;
+    }
+
+    function perp(v) {
+      return vec(-v.y, v.x);
+    }
+
+    function perpDot(a, b) {
+      return a.x * b.y - a.y * b.x;
+    }
+
+    function clamp(v, lo, hi) {
+      return Math.max(lo, Math.min(hi, v));
+    }
+
+    function rand(min, max) {
+      return Math.random() * (max - min) + min;
+    }
+
+    function positionAt(b, t) {
+      return add(add(b.pos, mul(b.vel, t)), mul(b.acc, 0.5 * t * t));
+    }
+
+    function velocityAt(b, t) {
+      return add(b.vel, mul(b.acc, t));
+    }
+
+    function momentOfInertia(b) {
+      return 0.5 * b.mass * b.radius * b.radius;
+    }
+
+    function isImmovable(b) {
+      return b.isStatic;
+    }
+
+    function calculateCollisionWeights(b1, b2) {
+      if (isImmovable(b1)) return [0, 1];
+      if (isImmovable(b2)) return [1, 0];
+      const m1 = Math.max(1e-6, b1.mass);
+      const m2 = Math.max(1e-6, b2.mass);
+      return [m2 / (m1 + m2), m1 / (m1 + m2)];
+    }
+
+    function calculateRestitutionCoefficient(b1, b2) {
+      const m1 = b1.mass;
+      const m2 = b2.mass;
+      const totalMass = m1 + m2;
+      const maxMass = Math.max(m1, m2);
+      const minMass = Math.max(1, Math.min(m1, m2));
+      const massRatio = Math.max(1, maxMass / minMass);
+
+      if (maxMass > CelestialBodyType.MOON_MAX) return 0.01;
+      if (massRatio > 1e3) return 0.04;
+      if (massRatio > 50) return 0.07;
+
+      const MAX_RESTITUTION = 0.16;
+      const MIN_RESTITUTION = 0.04;
+      const MASS_THRESHOLD = 2e5;
+      const massFactor = Math.exp(-totalMass / MASS_THRESHOLD);
+      return clamp(
+        MIN_RESTITUTION + (MAX_RESTITUTION - MIN_RESTITUTION) * massFactor,
+        MIN_RESTITUTION,
+        MAX_RESTITUTION,
+      );
+    }
+
+    function calculateFrictionCoefficient(m1, m2) {
+      const maxMass = Math.max(m1, m2);
+      if (maxMass > CelestialBodyType.MOON_MAX) return 0.1;
+      if (maxMass > CelestialBodyType.ASTEROID_MAX) return 0.4;
+      return 0.2;
+    }
+
+    function contactNormalAndPenetration(b1, b2) {
+      const delta = sub(b2.pos, b1.pos);
+      const distance = length(delta);
+      const totalRadius = b1.radius + b2.radius;
+      if (distance <= Number.EPSILON) return [vec(1, 0), totalRadius];
+      return [mul(delta, 1 / distance), Math.max(0, totalRadius - distance)];
+    }
+
+    function contactStateAtTime(b1, b2, time) {
+      if (time <= Number.EPSILON) return contactNormalAndPenetration(b1, b2);
+      const p1 = positionAt(b1, time);
+      const p2 = positionAt(b2, time);
+      const delta = sub(p2, p1);
+      const distance = length(delta);
+      const normal = distance <= Number.EPSILON ? vec(1, 0) : mul(delta, 1 / distance);
+      const penetration = Math.max(0, b1.radius + b2.radius - distance);
+      return [normal, penetration];
+    }
+
+    function positionalCorrection(b1, b2, normal, penetration, w1, w2) {
+      const maxCorrection = (b1.radius + b2.radius) * MAX_CORRECTION_FRACTION;
+      const bias = Math.min(maxCorrection, Math.max(0, penetration - PENETRATION_SLOP) * BAUMGARTE_BIAS);
+      if (bias <= 0) return;
+      b1.pos = sub(b1.pos, mul(normal, bias * w1));
+      b2.pos = add(b2.pos, mul(normal, bias * w2));
+    }
+
+    function findImpactTime(b1, b2, dt) {
+      const r = b1.radius + b2.radius;
+      const relVel = sub(b2.vel, b1.vel);
+      const relAcc = sub(b2.acc, b1.acc);
+
+      const accScale = length(relAcc) * dt;
+      const velScale = length(relVel) + 1e-5;
+      let steps = accScale <= velScale * 0.25 ? 1 : accScale <= velScale * 0.75 ? 2 : 4;
+      steps = Math.max(1, steps);
+
+      const relativePosition = (t) => sub(positionAt(b2, t), positionAt(b1, t));
+
+      for (let step = 0; step < steps; step += 1) {
+        const t0 = (dt * step) / steps;
+        const t1 = (dt * (step + 1)) / steps;
+        const subDt = Math.max(Number.EPSILON, t1 - t0);
+
+        const p0 = relativePosition(t0);
+        const p1 = relativePosition(t1);
+        const vSegment = mul(sub(p1, p0), 1 / subDt);
+
+        const a = lengthSquared(vSegment);
+        const c = lengthSquared(p0) - r * r;
+        if (a <= Number.EPSILON) {
+          if (c <= 0) return t0;
+          continue;
+        }
+
+        const b = 2 * dot(p0, vSegment);
+        const disc = b * b - 4 * a * c;
+        if (disc < 0) continue;
+
+        const tLocal = (-b - Math.sqrt(disc)) / (2 * a);
+        if (tLocal >= 0 && tLocal <= subDt) return t0 + tLocal;
+      }
+
+      return null;
+    }
+
+    function resolveCollision(b1, b2, dt) {
+      if (isImmovable(b1) && isImmovable(b2)) return;
+
+      const delta = sub(b2.pos, b1.pos);
+      const radii = b1.radius + b2.radius;
+      const distSq = lengthSquared(delta);
+      const impactTime = distSq <= radii * radii ? 0 : findImpactTime(b1, b2, dt);
+      if (impactTime === null) return;
+
+      const normalizedTime = dt <= Number.EPSILON ? 0 : impactTime / dt;
+      const contactWeight = normalizedTime <= SPECULATIVE_CONTACT_THRESHOLD
+        ? 1
+        : Math.max(0, 1 - ((normalizedTime - SPECULATIVE_CONTACT_THRESHOLD) / (1 - SPECULATIVE_CONTACT_THRESHOLD)));
+
+      const sampleTime = Math.max(0, impactTime);
+      const [initialNormal] = contactStateAtTime(b1, b2, sampleTime);
+      const [worldNormal, penetration] = contactNormalAndPenetration(b1, b2);
+      const normal = sampleTime > 0 ? initialNormal : worldNormal;
+
+      if (lengthSquared(normal) <= Number.EPSILON) return;
+
+      const [w1, w2] = calculateCollisionWeights(b1, b2);
+      if (penetration > PENETRATION_SLOP) positionalCorrection(b1, b2, worldNormal, penetration, w1, w2);
+
+      const invM1 = isImmovable(b1) ? 0 : 1 / Math.max(1e-6, b1.mass);
+      const invM2 = isImmovable(b2) ? 0 : 1 / Math.max(1e-6, b2.mass);
+      const invMassSum = invM1 + invM2;
+      if (invMassSum <= Number.EPSILON) return;
+
+      const invI1 = isImmovable(b1) ? 0 : 1 / Math.max(1e-6, momentOfInertia(b1));
+      const invI2 = isImmovable(b2) ? 0 : 1 / Math.max(1e-6, momentOfInertia(b2));
+
+      const r1 = mul(normal, b1.radius);
+      const r2 = mul(normal, -b2.radius);
+      const relativeVelocity = sub(
+        add(velocityAt(b2, sampleTime), mul(perp(r2), b2.angularVelocity)),
+        add(velocityAt(b1, sampleTime), mul(perp(r1), b1.angularVelocity)),
+      );
+
+      const vn = dot(relativeVelocity, normal);
+      if (vn >= 0) return;
+
+      const restitution = calculateRestitutionCoefficient(b1, b2);
+      const r1CrossN = perpDot(r1, normal);
+      const r2CrossN = perpDot(r2, normal);
+      const normalMass = invMassSum + r1CrossN * r1CrossN * invI1 + r2CrossN * r2CrossN * invI2;
+      const jn = (-(1 + restitution) * vn) / Math.max(1e-6, normalMass);
+      const impulseN = mul(normal, jn * contactWeight);
+
+      if (!isImmovable(b1)) {
+        b1.vel = sub(b1.vel, mul(impulseN, invM1));
+        b1.angularVelocity -= perpDot(r1, impulseN) * invI1;
+      }
+      if (!isImmovable(b2)) {
+        b2.vel = add(b2.vel, mul(impulseN, invM2));
+        b2.angularVelocity += perpDot(r2, impulseN) * invI2;
+      }
+
+      const tangent = perp(normal);
+      const vt = dot(relativeVelocity, tangent);
+      const r1CrossT = perpDot(r1, tangent);
+      const r2CrossT = perpDot(r2, tangent);
+      const tangentMass = invMassSum + r1CrossT * r1CrossT * invI1 + r2CrossT * r2CrossT * invI2;
+
+      let jt = -vt / Math.max(1e-6, tangentMass);
+      const mu = calculateFrictionCoefficient(b1.mass, b2.mass);
+      const frictionLimit = mu * Math.abs(jn);
+      jt = clamp(jt, -frictionLimit, frictionLimit);
+
+      const impulseT = mul(tangent, jt * contactWeight);
+      if (!isImmovable(b1)) {
+        b1.vel = sub(b1.vel, mul(impulseT, invM1));
+        b1.angularVelocity -= perpDot(r1, impulseT) * invI1;
+      }
+      if (!isImmovable(b2)) {
+        b2.vel = add(b2.vel, mul(impulseT, invM2));
+        b2.angularVelocity += perpDot(r2, impulseT) * invI2;
+      }
+    }
+
+    function resolveCollisions() {
+      for (let i = 0; i < world.bodies.length; i += 1) {
+        for (let j = i + 1; j < world.bodies.length; j += 1) {
+          resolveCollision(world.bodies[i], world.bodies[j], world.dt);
+        }
+      }
+    }
+
+    function keepInBounds(body) {
+      if (body.isStatic) return;
+
+      if (body.pos.x - body.radius < 0) {
+        body.pos.x = body.radius;
+        body.vel.x = Math.abs(body.vel.x) * 0.4;
+      } else if (body.pos.x + body.radius > world.width) {
+        body.pos.x = world.width - body.radius;
+        body.vel.x = -Math.abs(body.vel.x) * 0.4;
+      }
+
+      if (body.pos.y - body.radius < 0) {
+        body.pos.y = body.radius;
+        body.vel.y = Math.abs(body.vel.y) * 0.4;
+      } else if (body.pos.y + body.radius > world.height) {
+        body.pos.y = world.height - body.radius;
+        body.vel.y = -Math.abs(body.vel.y) * 0.4;
+      }
+    }
+
+    function updatePlayer(body) {
+      // FIX: Increased thrust from 500 to 400,000 to match mass scale (2400)
+      const thrust = 400000; 
+      body.acc = mul(input.value, thrust / Math.max(1, body.mass));
+      if (lengthSquared(input.value) > 0.0001) {
+        body.heading = Math.atan2(input.value.y, input.value.x);
+      }
+    }
+
+    function integrate(body) {
+      if (body.isStatic) return;
+      body.vel = add(body.vel, mul(body.acc, world.dt));
+      body.vel = mul(body.vel, 0.995);
+      body.pos = add(body.pos, mul(body.vel, world.dt));
+      body.angularVelocity *= 0.99;
+      keepInBounds(body);
+    }
+
+    function drawBody(body) {
+      ctx.beginPath();
+      ctx.arc(body.pos.x, body.pos.y, body.radius, 0, Math.PI * 2);
+      ctx.fillStyle = body.color;
+      ctx.fill();
+
+      if (body.type === "ship") {
+        const nose = add(body.pos, vec(Math.cos(body.heading) * body.radius * 1.4, Math.sin(body.heading) * body.radius * 1.4));
+        const wing1 = add(body.pos, vec(Math.cos(body.heading + 2.5) * body.radius * 0.9, Math.sin(body.heading + 2.5) * body.radius * 0.9));
+        const wing2 = add(body.pos, vec(Math.cos(body.heading - 2.5) * body.radius * 0.9, Math.sin(body.heading - 2.5) * body.radius * 0.9));
+        ctx.beginPath();
+        ctx.moveTo(nose.x, nose.y);
+        ctx.lineTo(wing1.x, wing1.y);
+        ctx.lineTo(wing2.x, wing2.y);
+        ctx.closePath();
+        ctx.fillStyle = "#eaf2ff";
+        ctx.fill();
+      }
+    }
+
+    function frame() {
+      updatePlayer(world.player);
+
+      for (const body of world.bodies) integrate(body);
+      resolveCollisions();
+
+      ctx.clearRect(0, 0, world.width, world.height);
+      for (const body of world.bodies) drawBody(body);
+
+      debugEl.textContent = `ship speed ${length(world.player.vel).toFixed(1)} | colliders ${world.bodies.length}`;
+      requestAnimationFrame(frame);
+    }
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      world.width = width;
+      world.height = height;
+    }
+
+    function setupJoystick() {
+      const onMove = (event) => {
+        if (event.pointerId !== input.pointerId) return;
+        const dx = event.clientX - input.center.x;
+        const dy = event.clientY - input.center.y;
+        const dist = Math.hypot(dx, dy);
+        const scale = dist > input.maxRadius ? input.maxRadius / dist : 1;
+        const sx = dx * scale;
+        const sy = dy * scale;
+
+        input.value = vec(sx / input.maxRadius, sy / input.maxRadius);
+        stickEl.style.transform = `translate(${sx}px, ${sy}px)`;
+      };
+
+      window.addEventListener("pointerdown", (event) => {
+        if (event.pointerType === "mouse" && event.button !== 0) return;
+        input.pointerId = event.pointerId;
+        input.center = vec(event.clientX, event.clientY);
+        input.value = vec(0, 0);
+
+        joystickEl.classList.remove("hidden");
+        joystickEl.style.left = `${input.center.x}px`;
+        joystickEl.style.top = `${input.center.y}px`;
+        stickEl.style.transform = "translate(0, 0)";
+      });
+
+      window.addEventListener("pointermove", onMove);
+
+      const endInput = (event) => {
+        if (event.pointerId !== input.pointerId) return;
+        input.pointerId = null;
+        input.value = vec(0, 0);
+        joystickEl.classList.add("hidden");
+        stickEl.style.transform = "translate(0, 0)";
+      };
+
+      window.addEventListener("pointerup", endInput);
+      window.addEventListener("pointercancel", endInput);
+    }
+
+    function createBody(partial) {
+      return {
+        type: "asteroid",
+        pos: vec(),
+        vel: vec(),
+        acc: vec(),
+        mass: 1,
+        radius: 10,
+        angularVelocity: 0,
+        heading: 0,
+        isStatic: false,
+        color: "#7f8ca8",
+        ...partial,
+      };
+    }
+
+    function seedWorld() {
+      const player = createBody({
+        type: "ship",
+        pos: vec(world.width * 0.35, world.height * 0.5),
+        mass: 2400,
+        radius: 16,
+        color: "#6aa4ff",
+      });
+
+      const colliders = [];
+      for (let i = 0; i < 22; i += 1) {
+        const radius = rand(12, 28);
+        colliders.push(createBody({
+          pos: vec(rand(radius, world.width - radius), rand(radius, world.height - radius)),
+          vel: vec(rand(-40, 40), rand(-40, 40)),
+          mass: radius * radius * 25,
+          radius,
+          color: `hsl(${rand(20, 50)} 28% ${rand(35, 55)}%)`,
+          angularVelocity: rand(-0.2, 0.2),
+        }));
+      }
+
+      const anchor = createBody({
+        pos: vec(world.width * 0.74, world.height * 0.47),
+        vel: vec(),
+        mass: 9e7,
+        radius: 42,
+        isStatic: true,
+        color: "#5f6778",
+      });
+
+      world.player = player;
+      world.bodies = [player, anchor, ...colliders];
+    }
+
+    resize();
+    seedWorld();
+    setupJoystick();
+    window.addEventListener("resize", resize);
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
